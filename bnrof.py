@@ -2457,8 +2457,6 @@ def calculate_param_uncertainty(obs_vals,obs_errs,model,params,result,independen
 				#   adjust the maxchisqr now or the error will be artificially large.
 				min_eval_chisqr =  param_list[np.argmin(chisqr_list)]
 				if min_eval_chisqr<chisqr0-np.abs(chisqr0-chisqrmax)/2.0:
-					print('WARNING: Local minima found that is different from initial value.')
-					print('Enable show_plots=True and check quality of initial fit.')
 					opt_val = param_list[np.argmin(chisqr_list)]
 					opt_chisqr  = np.mean([chisqr0,np.min(chisqr_list)])
 				else:
@@ -2557,6 +2555,9 @@ def factorization_f(n,m,delE,**vals):
 	calcI = slice2D.flatten()
 	#chisqr = np.nansum((z_fit - calcI)**2 / (meas_errs**2))/num_points
 	return calcI
+def linear_FF_term(q,FF,A):
+    #Q and FF must be same shae
+    return A*(np.ones(len(q))/FF)
 def uncertainty_determination(fit_params,z_test,obs_errs,model,result,independent_var_arr=False,fast_mode=False,extrapolate=False,show_plots=False,fname='placeholder.jpg',overwrite_prev=False,num_chisqr_test_points=30):
 	#Does a rocking curve foreach parameter to determine its uncertainty
 	#Assumes that z is already flatted into a 1D array
@@ -2567,7 +2568,13 @@ def uncertainty_determination(fit_params,z_test,obs_errs,model,result,independen
 	for key in errs.keys():
 		err_array.append(errs[key])
 	return err_array
-
+def fourier_term(q,A,d,FF):
+    #For use in extracting spin-spin f_q_correlations
+    #Requires magFF in same shape as Q
+    # Scales scattering by magnetic form factor
+    q = np.array(q)
+    FF = np.array(FF)
+    return A*(1-np.sin(q*d)/(q*d))/FF
 def get_MANTID_magFF(q,mag_ion):
 	#Given a str returns a simple array of the mantid defined form factor. basically a shortcut for the mantid version
 	cw = CreateWorkspace(DataX = q,DataY = np.ones(len(q)))
@@ -2623,3 +2630,153 @@ class ProgressBar(object):
 		self.current = self.total
 		self()
 		print('', file=self.output)
+
+    
+def extract_Q_correlations(q,f_q,f_q_err,vary_d=True,d_arr=False,mag_FF_file='sample.txt',mag_ion=False,lin_term=False,num_d=1,min_d=2.0,max_d=20.0):
+    #get an effective interaction distance from some generic q_dependent signal
+    # Form factor should already be calculated
+    if d_arr!=False:
+        #Basically want to call a different function with the same arguments
+        model,result,comps = f_q_correlations(q,f_q,f_q_err,d_arr,deb_waller_extra=False,mag_ion=mag_ion,mag_FF_file=mag_FF_file,\
+            fname='correlation_uncertainties.txt',show_fit=False,lin_term=False)
+        return model, result,d_arr
+    if mag_FF_file!=False:
+        input_data = np.genfromtxt(mag_FF_file)
+        input_q = input_data[:,0]
+        input_FF = input_data[:,1]
+        f_FF = scipy.interpolate.interp1d(input_q,input_FF,kind='linear',fill_value='extrapolate')
+    elif mag_ion!=False:
+        input_FF = 1.0/(np.array(get_MANTID_magFF(q,mag_ion)[1]))
+        f_FF=scipy.interpolate.interp1d(q,input_FF,kind='linear',fill_value='extrapolate')
+    FFcorrection= 1.0/f_FF(q)
+    #fourier_term(q,A,d,FF)
+    correlation_Model=Model(fourier_term,independent_vars=['q','FF'],prefix='d1_')
+    for i in np.arange(1,num_d,1):
+        correlation_Model=correlation_Model+Model(fourier_term,independent_vars=['q','FF'],prefix='d'+str(i+1)+'_')
+    if lin_term!=False:
+        correlation_Model=correlation_Model+Model(flat_bkg)
+    corr_params= correlation_Model.make_params()
+    for i in np.arange(0,num_d,1):
+        corr_params.add('d'+str(i+1)+'_d',vary=vary_d,value=3.0+1.5*i,min=min_d,max=max_d)
+        corr_params.add('d'+str(i+1)+'_A',vary=True,value=1.0,min=-1e4,max=1e4)
+    if lin_term!=False:
+        corr_params.add('m',vary=False,value=0)
+        corr_params.add('c',vary=True,value=0,min=0,max=1e4)
+    weights=1.0/f_q_err
+    result  = correlation_Model.fit(f_q,q=q,FF=FFcorrection,weights=weights,params=corr_params,method='powell')
+    d_eff_arr=[]
+    for i in np.arange(0,num_d,1):
+        d_extract=result.params['d'+str(i+1)+'_d'].value
+        d_eff_arr.append(d_extract)
+    print('Extracted distance scale(s)='+str(d_eff_arr))
+    return correlation_Model,result,d_eff_arr
+
+
+def f_q_correlations(q,f_q,f_q_err,d_arr,deb_waller_extra=True,mag_ion='Ru0',mag_FF_file=False,fname='fourier_uncertainties.txt',show_fit=False,lin_term=False,FF_linear_term=False):
+    #From previously calculated F(Q) factorization extracts spin-spin correlations
+    # D_arr lists distances to use in factorizations
+    # Mag_ion corrects for the magnetic form factor. List of suitable ones can be
+    # found in the MANTID documentation
+    q = np.array(q)
+    f_q = np.array(f_q)
+    f_q_err = np.array(f_q_err)
+    if len(d_arr)==0 or type(d_arr)!=list:
+        print('Exception: D_arr must be in form of an array (even if just one value)')
+        print(d_arr)
+        return 0
+
+    i = 0
+    d = {}
+    for i in range(len(d_arr)):
+        d['d'+str(i)]=d_arr[i]
+    if mag_ion!=False:
+        cw = CreateWorkspace(DataX = q,DataY = np.ones(len(q)))
+        cw.getAxis(0).setUnit('MomentumTransfer')
+        ws_corr = MagFormFactorCorrection(cw,IonName=mag_ion,FormFactorWorkspace='FF')
+        FFcorrection = np.array(ws_corr[0].readY(0))
+    else:
+        #load in the pre-calculated file
+        input_data = np.genfromtxt(mag_FF_file)
+        input_q = input_data[:,0]
+        input_FF = input_data[:,1]
+        f_FF = scipy.interpolate.interp1d(input_q,input_FF,kind='linear',fill_value='extrapolate')
+        FFcorrection= 1.0/f_FF(q)
+
+    fourier_model = Model(fourier_term,prefix='d1_',independent_vars=['FF','q'])
+
+    for i in range(len(d_arr))[1:]:
+        fourier_model = fourier_model+Model(fourier_term,prefix='d'+str(i+1)+'_',independent_vars=['FF','q'])
+    if deb_waller_extra==True:
+        fourier_model = fourier_model + Model(deb_waller_phonon)
+    if lin_term!=False:
+        fourier_model=fourier_model+Model(flat_bkg,prefix='lin_')
+    if FF_linear_term!=False:
+        fourier_model=fourier_model+Model(linear_FF_term,prefix='lin_FF_',independent_vars=['FF','q'])
+    fourier_params = fourier_model.make_params()
+    min_max_val = 1000
+    for i in range(len(d_arr)):
+        fourier_params.add('d'+str(i+1)+'_A',vary=True,value=1.0,min=-min_max_val,max = min_max_val)
+        fourier_params.add('d'+str(i+1)+'_d',vary=False,value=d_arr[i])
+    if deb_waller_extra==True:
+        fourier_params.add('beta',vary=True,value=0.0001,min=0,max=100)
+    if lin_term!=False:
+        fourier_params.add('lin_m',vary=False,value=0)
+        fourier_params.add('lin_c',vary=True,value=0)
+    if linear_FF_term!=False:
+        fourier_params.add('lin_FF_A',vary=True,value=0.0,min=0,max=min_max_val)
+    weights= np.ones(len(q))
+    weights = 1.0/np.array(f_q_err)
+    weights[np.where(f_q==0)[0]] = 0
+    weights[np.where(np.isnan(f_q))[0]]=0
+    #weights[np.where(weights>10)[0]]=10.0
+    #weights[np.where(q<0.3)]=0.0
+    fourier_result = fourier_model.fit(f_q,q=q,FF=FFcorrection,params=fourier_params,method='least_squares',weights=weights)
+    #print(fourier_result.fit_report())
+    if os.path.isfile(fname):
+        fourier_errs=np.genfromtxt(fname)
+    else:
+        fourier_errs = uncertainty_determination(fourier_result.params,f_q,weights,fourier_model,\
+                            fourier_result,independent_var_arr=fourier_model.independent_vars,fast_mode=True,\
+                            extrapolate=True,show_plots=False,fname=fname)
+    k=0
+    for param in fourier_result.params:
+        if fourier_result.params[param].vary==True:
+            print(param+'='+str(round(fourier_result.params[param].value,3))+ '+/-'+str(round(fourier_errs[k],3)))
+        else:
+            print(param+'='+str(round(fourier_result.params[param].value,3))+' (fixed)')
+        k=k+1
+    k=0
+    comps = fourier_result.eval_components(q=q,FF=FFcorrection)
+    limit=0
+    eval_comps=np.zeros(len(q))
+    for comp in comps:
+        if comp != 'beta' and comp !='deb_waller_phonond':
+            eval_comps = eval_comps+comps[comp]
+            #fourier_ax[1].plot(x_bin,comps[comp]/spline_Ir_FF(x_bin),label=str(comp)+'='+str(round(fourier_result.params[comp+'d'].value,3))+' $\AA^{-1}$')
+    # return the results- have q,f_q,f_q_err, just require the model and the fit params
+    if show_fit ==True:
+        fourier_fig, fourier_ax = plt.subplots(1,2,figsize=(12,7))
+        fourier_ax[0].set_title('F(Q) fit')
+        fourier_ax[0].set_xlabel('|Q| $\AA^{-1}$')
+        fourier_ax[0].set_ylabel('Intensity (barn / meV$\cdot$sr$\cdot$mol)')
+        fourier_ax[0].errorbar(q,f_q,yerr=f_q_err,ls=' ',marker='o',color='k',mfc='w',mec='k',mew=1,capsize=3,label='F(Q)')
+        fourier_ax[0].plot(q,eval_comps,color='g',label='Magnetic Scattering')
+        fourier_ax[0].plot(q,fourier_result.best_fit,'r')
+        if deb_waller_extra==True:
+            fourier_ax[0].plot(q,deb_waller_phonon(q,fourier_result.params['beta'].value),color='b',label='Phonon Contribution',ls='--')
+        if lin_term!=False:
+            fourier_ax[0].plot(q,flat_bkg(q,0,fourier_result.params['lin_c'].value),color='m',label='linear_background',ls='--')
+        if linear_FF_term!=False:
+            fourier_ax[0].plot(q,linear_FF_term(q,FFcorrection,fourier_result.params['lin_FF_A'].value))
+        fourier_ax[0].legend()
+
+        
+        for comp in comps:
+            print(comp)
+            if comp!='beta' and comp!='deb_waller_phonon' and comp!='lin_' and comp !='lin_FF_':
+                fourier_ax[1].plot(q,comps[comp]*FFcorrection,label=str(comp)+'='+str(round(fourier_result.params[comp+'d'].value,3))+\
+                ' $\AA^{-1}$')
+        fourier_ax[1].set_title('Fourier components of fit')
+        fourier_ax[1].set_xlabel('|Q| $\AA^{-1}$')
+        fourier_ax[1].legend()
+    return fourier_model, fourier_result, eval_comps
