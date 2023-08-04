@@ -2558,6 +2558,7 @@ def factorization_f(n,m,delE,**vals):
 def linear_FF_term(q,FF,A):
     #Q and FF must be same shae
     return A*(np.ones(len(q))/FF)
+    
 def uncertainty_determination(fit_params,z_test,obs_errs,model,result,independent_var_arr=False,fast_mode=False,extrapolate=False,show_plots=False,fname='placeholder.jpg',overwrite_prev=False,num_chisqr_test_points=30):
 	#Does a rocking curve foreach parameter to determine its uncertainty
 	#Assumes that z is already flatted into a 1D array
