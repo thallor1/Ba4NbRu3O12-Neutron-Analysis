@@ -8,10 +8,85 @@ import lmfit
 from lmfit import Model,Parameters
 from mantid.geometry import CrystalStructure, ReflectionGenerator, ReflectionConditionFilter
 import MDUtils as mdu
+import scipy 
+import traceback
 '''
 Below are some of the functions used throughout the analysis of Ba4NbRu3O12 data. 
 They are defined here so as to not clog up the notebooks. 
 '''
+
+def sub_highQ_cut(in_MD,qlim,elim,scale=1.0):
+	work_MD = in_MD.clone()
+	dims = work_MD.getNonIntegratedDimensions()
+	qdim,edim = mdu.dim2array(dims[0]),mdu.dim2array(dims[1])
+	eres = np.abs(edim[1]-edim[0])
+	sliced_MD = slice_box_QE_MD(work_MD,[0,np.max(qlim)],elim).clone()
+	#Subtract the high Q cut from the rest of the measurement
+	e,I,err = cut_MDHisto_powder(work_MD,'DeltaE',[elim[0],elim[1],eres],qlim)
+
+	I_slice = np.copy(sliced_MD.getSignalArray())
+	#This is slow but we can simply iterate through every point...
+	for i in range(len(I_slice[:,0])):
+		for j in range(len(I_slice[0,:])):
+			energy = edim[j]
+			near_i = np.argmin(np.abs(e-energy))
+			cut_I = I[near_i]
+			I_slice[i,j]-=cut_I*scale
+	sliced_MD.setSignalArray(I_slice)
+	return sliced_MD
+
+
+def tempsubtract_cut2D(lowT_cut2D_T,highT_cut2D_T,tLow,tHigh,numEvNorm=False,vmin=0,vmax=5):
+	#Same as normal bose einstein temperature subtraction but with cut2d workspaces instead of filenames.
+	#Normalize by num events
+	#Scale the highT dataset by bose-population factor
+	highT_cut2D_tempsub = highT_cut2D_T.clone()
+	lowT_cut2D_tempsub = lowT_cut2D_T.clone()
+	hight_plot_tempsub = highT_cut2D_tempsub.clone()
+	#pre_H_fig,pre_H_ax = fancy_plot_cut2D(hight_plot_tempsub, vmin=0,vmax=10,title='T=120K pre-scale')
+
+	dims = lowT_cut2D_tempsub.getNonIntegratedDimensions()
+	q_values = mdu.dim2array(dims[0])
+	energies = mdu.dim2array(dims[1])
+	if numEvNorm==True:
+		lowT_cut2D_tempsub=normalize_MDHisto_event(lowT_cut2D_tempsub)
+		highT_cut2D_tempsub = normalize_MDHisto_event(highT_cut2D_tempsub)
+	kb=8.617e-2
+	bose_factor_lowT = (1-np.exp(-energies/(kb*tLow)))
+	bose_factor_highT = (1-np.exp(-energies/(kb*tHigh)))
+	#Only makes sense for positive transfer
+	bose_factor_lowT[np.where(energies<0)]=0
+	bose_factor_highT[np.where(energies<0)]=0
+	highT_Intensity = np.copy(highT_cut2D_tempsub.getSignalArray())
+	highT_err = np.sqrt(np.copy(highT_cut2D_tempsub.getErrorSquaredArray()))
+	bose_factor = bose_factor_highT/bose_factor_lowT
+	highT_Intensity_corrected = bose_factor*highT_Intensity
+	highT_err_corrected = bose_factor*highT_err
+	highT_Intensity_corrected[np.where(highT_Intensity_corrected==0)]=0
+	highT_err_corrected[np.where(highT_err_corrected==0)]=0
+	highT_Intensity_corrected[np.isnan(highT_Intensity_corrected)]=0
+	highT_err_corrected[np.isnan(highT_err_corrected)]=0
+
+	highT_cut2D_tempsub.setSignalArray(highT_Intensity_corrected)
+	highT_cut2D_tempsub.setErrorSquaredArray(highT_err_corrected**2)
+	highT_plot_cut2D = highT_cut2D_tempsub.clone()
+	lowt_tempsub_plot = lowT_cut2D_tempsub.clone()
+	#pre_L_fig, pre_L_ax = fancy_plot_cut2D(lowt_tempsub_plot,vmin=vmin,vmax=vmax,title='T=5K')
+	#post_H_fig, post_H_ax = fancy_plot_cut2D(highT_plot_cut2D,vmin=vmin,vmax=vmax,title='T=120K post-scale')
+	#Don't really know if MANTID handles the subtraction well...
+	lowT_cut2D_intensity = np.copy(lowT_cut2D_tempsub.getSignalArray())
+	lowT_cut2D_err = np.sqrt(np.copy(lowT_cut2D_tempsub.getErrorSquaredArray()))
+
+	mag_intensity = lowT_cut2D_intensity - highT_Intensity_corrected
+	mag_err = np.sqrt(lowT_cut2D_err**2 + highT_err_corrected**2)
+
+	cut2D_mag_tempsub= lowT_cut2D_tempsub.clone()
+	cut2D_mag_tempsub.setSignalArray(mag_intensity)
+	cut2D_mag_tempsub.setErrorSquaredArray(mag_err**2)
+	cut2D_mag_tempsub_plot = cut2D_mag_tempsub.clone()
+	#manget_fig,magnet_ax = fancy_plot_cut2D(cut2D_mag_tempsub_plot,vmin=vmin,vmax=vmax,title='magnetism')
+	return cut2D_mag_tempsub
+
 
 
 def load_iexy(fnames):
@@ -293,7 +368,7 @@ class IEXY_data:
 		q_min = np.min(q_arr)
 		q_max = np.max(q_arr)
 		q_all = np.linspace(q_min,q_max,1000)
-		Q_ff, FF = THfuncs.get_MANTID_magFF(q_all,mag_ion)
+		Q_ff, FF = get_MANTID_magFF(q_all,mag_ion)
 		for i in range(len(self.intensity)):
 			q_ind = np.argmin(np.abs(q_all-self.q[i]))
 			FF_ind = FF[q_ind]
@@ -339,7 +414,118 @@ class IEXY_data:
 		out_ws = CreateMDHistoWorkspace(Dimensionality=2,Extents=extents_str,SignalInput=I_arr,ErrorInput=err_arr,NumberOfBins=num_bin_str,NumberOfEvents=np.ones(len(self.intensity)),Names='Dim1,Dim2',Units='MomentumTransfer,EnergyTransfer')
 		return out_ws
 
- 
+
+def stitch_MD(MD_arr,q_limits=False,e_limits=False,q_res=0.02,e_res=0.1,mode='overwrite'):
+	#Overlaps different MDHisto datasets if one is preferred for any reason. 
+	#Will go in order of priority- like so
+	#Make sure that all MDHistoWorkspaces have the same binning distances
+
+	#Assumes the workspaces are normalized to match eachother- if not, can do so with the norm_WS argument.
+
+	# [highest_MD, second_MD,...., lowest MD]
+
+	# Creates a grid with the finest resolution of the datasets. Empty bins in coarser datasets are filled with a linear interpolation of the adjacent non-zero pixels.
+	# Of course, the errors of all of the pixels that were interpolated from need to be increased to account for this- rebinning should give the same error back as before stitching.
+
+	# if q and e limits are defined, they are taken as the min/max of each MD to use. Some datasets are weird at edge of kinematics so it's best to cut them off.
+	# Taken in format of [[qmin1,qmax1], [qmin2, qmax2], ...., [qmin_low,qmax_low]]
+
+
+	# First get all Q, E values necessary.
+	q_vals = []
+	e_vals = []
+	q_tot_min=0
+	q_tot_max=0
+	e_tot_min=0
+	e_tot_max=0
+	e_res_tot=1e8
+	q_res_tot=1e8
+	for md in MD_arr:
+		dims=md.getNonIntegratedDimensions()
+		q=mdu.dim2array(dims[0])
+		e=mdu.dim2array(dims[1])
+		q_res = np.abs(q[1]-q[0])
+		e_res = np.abs(e[1]-e[0])
+		qmin=np.min(q)
+		if qmin<q_tot_min:
+			q_tot_min=qmin 
+		qmax=np.max(q)
+		if qmax>q_tot_max:
+			q_tot_max=qmax
+		emin=np.min(e)
+		if emin<e_tot_min:
+			e_tot_min=emin
+		emax=np.max(e)
+		if emax>e_tot_max:
+			e_tot_max=emax 
+		#only retain lowest resolution 
+		if q_res<q_res_tot:
+			q_res_tot=q_res
+		if e_res<e_res_tot:
+			e_res_tot=e_res
+	q_vals_output=np.arange(q_tot_min,q_tot_max+q_res_tot/2.0,q_res_tot)
+	e_vals_output=np.arange(e_tot_min,e_tot_max+e_res_tot/2.0,e_res_tot)
+	Q,E = np.meshgrid(e_vals_output,q_vals_output)
+	new_I, new_err = np.zeros(np.shape(Q)),np.zeros(np.shape(Q))
+	for i in range(len(MD_arr))[::-1]:
+		#Cycle through MD workspaces, giving the points in the grid the closest values in intensity and errro
+		MD = MD_arr[i]
+
+		I = np.copy(MD.getSignalArray())
+		err = np.sqrt(np.copy(MD.getErrorSquaredArray()))
+		dims = MD.getNonIntegratedDimensions()
+		num_use_mat = np.zeros(np.shape(I))
+		q = mdu.dim2array(dims[0])
+		e = mdu.dim2array(dims[1])
+		Q_curr,E_curr = np.meshgrid(q,e)
+		#elements that are zero or nan are out of the kinematic range and must not be appended to the final output. 
+		I[np.isnan(I)]=0
+		banned_i = np.where(I==0)
+		#Now cycle through the output grid and match the closest index. If the intensity has already been appended to the output_arr,
+		# be sure to adjust the error for the number of times it's been assigned at the end. (Goes as sqrt(N))
+		if q_limits!=False:
+			q_min_curr = q_limits[i][0]
+			q_max_curr = q_limits[i][1]
+		else:
+			q_min_curr = np.min(q)-1.0
+			q_max_curr = np.max(q)+1.0
+		if e_limits!=False:
+			e_min_curr = e_limits[i][0]
+			e_max_curr = e_limits[i][1]
+		else:
+			e_min_curr = np.min(e)-1.0
+			e_max_curr = np.max(e)+1.0
+		for j in range(len(q_vals_output)):
+			for k in range(len(e_vals_output)):
+				#For each point in the grid, get the closest value in the relevant MDHisto
+				e_grid_val = e_vals_output[k]
+				q_grid_val = q_vals_output[j]
+				closest_e_ind = np.argmin(np.abs(e_grid_val-e))
+				closest_q_ind = np.argmin(np.abs(q_grid_val-q))
+				banned_condition = (closest_q_ind in banned_i[0] and closest_e_ind in banned_i[1])
+				q_val = q[closest_q_ind]
+				e_val = e[closest_e_ind]
+				I_val = I[closest_q_ind,closest_e_ind]
+				Err_val = err[closest_q_ind,closest_e_ind]
+				if not np.isnan(I_val) and I_val!=0 and q_val>=q_min_curr and q_val<=q_max_curr and e_val<=e_max_curr and e_val>=e_min_curr:
+					if num_use_mat[closest_q_ind,closest_e_ind]==0:
+						new_I[j,k]=I_val 
+						new_err[j,k]=Err_val 
+
+					if num_use_mat[closest_q_ind,closest_e_ind]>0 and mode!='weighted_mean':
+						#Need to adjust the errors. First bring it back to one use. 
+						new_I[j,k]=I_val
+						scaled_err = Err_val/np.sqrt(num_use_mat[closest_q_ind,closest_e_ind])
+						new_err[j,k]=scaled_err*np.sqrt(num_use_mat[closest_q_ind,closest_e_ind]+1.0)
+					num_use_mat[closest_q_ind,closest_e_ind]+=1.0
+	new_I = new_I.T 
+	new_err = new_err.T
+	#Create the output workspace
+	extents_str = str(np.min(q_vals_output))+','+str(np.max(q_vals_output))+','+str(np.min(e_vals_output))+','+str(np.max(e_vals_output))
+	num_bins_str = str(len(q_vals_output))+','+str(len(e_vals_output)) 
+
+	output_ws = CreateMDHistoWorkspace(Dimensionality=2,SignalInput=new_I,ErrorInput=new_err,Extents=extents_str,NumberOfBins=num_bins_str,Units='MomentumTransfer,EnergyTransfer',Names='|Q|,DeltaE')
+	return output_ws
 
 def stitch_iexy(primary_iexy,secondary_iexy):
 	#Takes two iexy objects with overlapping regions in coordinate space
@@ -1238,6 +1424,19 @@ def normalize_MDHisto_event(cut2D_normalize):
 		dataset.setErrorSquaredArray(normalized_error**2)
 	return sets[0]
 
+def undo_normalize_MDHisto_event(cut2D_normalize):
+	#Un-Normalizes a binned workspace by number of events
+	sets = [cut2D_normalize]
+	for dataset in sets:
+		non_normalized_intensity = np.copy(dataset.getSignalArray())
+		non_normalized_err = np.sqrt(np.copy(dataset.getErrorSquaredArray()))
+		num_events = np.copy(dataset.getNumEventsArray())
+		normalized_intensity=non_normalized_intensity*num_events
+		normalized_error = non_normalized_err*num_events
+		dataset.setSignalArray(normalized_intensity)
+		dataset.setErrorSquaredArray(normalized_error**2)
+	return sets[0]
+
 def correct_absorb_MD_Material(absorbMD,Ei,material_object,d_eff,abs_dict=False,plot_transmission=False):
 	#Assumes that a material object has already been created, calculates the proper absorption values. 
 	md_absorption=absorbMD.clone() 
@@ -1261,3 +1460,1166 @@ def correct_absorb_MD_Material(absorbMD,Ei,material_object,d_eff,abs_dict=False,
 		plt.plot(e,transmission,color='r')
 		plt.show()
 	return md_absorption
+
+
+
+def csv_to_MD(in_csv,skiprows=4,Ei=False,twoThetaMin=False,plot=False,transpose=False):
+	#Given a csv file, imports as an MDHistoworkspace. Useful for DFT!!
+	in_dat = np.loadtxt(open(in_csv,'rb'),delimiter=',',skiprows=skiprows)
+	if transpose==True:
+		in_dat = np.transpose(in_dat)
+	Q = in_dat[:,0]
+	E = in_dat[:,1]
+	I = in_dat[:,2]
+	Err = np.ones(np.shape(I)) #meaningless but zero gives errors
+	qres = np.abs(np.unique(Q)[1]-np.unique(Q)[0])
+	eres = np.abs(np.unique(E)[1]-np.unique(E)[0])
+
+	csv_to_iexy = IEXY_data()
+
+	csv_to_iexy.intensity=I
+	csv_to_iexy.err=Err
+	csv_to_iexy.q=Q
+	csv_to_iexy.energies=E
+	if plot==True:
+		fig,ax =csv_to_iexy.plot_slice(vmin=0,vmax=np.mean(I)/2.0,axis_extents=[0,np.max(Q),0,np.max(E)])
+		ax.set_xlim(0,np.max(Q))
+		ax.set_ylim(0,np.max(E))
+
+	csv_MD = csv_to_iexy.convert_to_MD()
+	if Ei!=False:
+		if twoThetaMin==False:
+			twoThetaMin=3.5
+		csv_MD=mask_minQ_fixedEi_MD(csv_MD,twoThetaMin,Ei)
+	out_MD = csv_MD.clone()
+	return out_MD
+
+def minQmacs(Ef,twoTheta,deltaE=0):
+	#Returns the lowest available Q for a given Ef and energy transfer
+	Ei = deltaE +Ef 
+	ki = np.sqrt(Ei/2.07)
+	kf = np.sqrt(Ef/2.07)
+	Q = np.sqrt( ki**2 + kf**2 - 2*ki*kf*np.cos(twoTheta*np.pi/180.0))
+	return Q, deltaE
+
+def minQseq(Ei,twoTheta,deltaE=0):
+	#Returns lowest Q for Ei
+	deltaEmax = Ei*0.9
+	if deltaE==0:
+		deltaE = np.linspace(0,deltaEmax,1000)
+
+	Ef = Ei - deltaE
+
+	ki = np.sqrt(Ei/2.07)
+	kf = np.sqrt(Ef/2.07)
+	Q = np.sqrt( ki**2 + kf**2 - 2*ki*kf*np.cos(twoTheta*np.pi/180))
+	return Q, deltaE
+
+def minQseq_multEi(Ei_arr,twoTheta,deltaE=0):
+	#returns lowest accessible Q for a number of Ei's
+	if not len(Ei_arr)>1:
+		print('This function only takes an array of incident energies.') 
+		return 0
+
+	Eiarr=np.array(Ei_arr)
+	if deltaE==0:
+		deltaE=np.linspace(0,np.max(Ei_arr)*0.9,1000)
+	Q_final_arr=[]
+	#for every deltaE find which Ei has the lowest accessible Q. 
+	# if the deltaE>0.9*Ef then this Ei is impossible
+	for i in range(len(deltaE)):
+		delE=deltaE[i]
+		minQ=1000.0 #placeholder values
+		for j in range(len(Eiarr)):
+			Ei=Eiarr[j]
+			if Ei>=0.9*delE:
+				#allowed
+				Ef = Ei - delE
+				ki = np.sqrt(Ei/2.07)
+				kf = np.sqrt(Ef/2.07)
+				Q = np.sqrt( ki**2 + kf**2 - 2*ki*kf*np.cos(twoTheta*np.pi/180))
+			else:
+				Q=10.0
+			if Q<minQ:
+				minQ=Q
+		Q_final_arr.append(minQ)
+	return np.array(Q_final_arr),np.array(deltaE)
+
+def mask_minQ_fixedEi_MD(seq_MD,twoThetaMin,Ei):
+	#Remove areas outside of kinematic limit of SEQ, or any instrument with fixed Ei
+	I = np.copy(seq_MD.getSignalArray())
+	err = np.sqrt(np.copy(seq_MD.getErrorSquaredArray()))
+	if type(Ei)==list:
+		Q_arr,E_max = minQseq_multEi(Ei,twoThetaMin)
+	else:
+		Q_arr,E_max = minQseq(Ei,twoThetaMin)
+	out_MD = seq_MD.clone()
+	dims = seq_MD.getNonIntegratedDimensions()
+	q_values = mdu.dim2array(dims[0])
+	energies = mdu.dim2array(dims[1])
+	for i in range(len(I)):
+		q_cut = I[i]
+		q_val = q_values[i]
+		err_cut = err[i]
+		kinematic_E = E_max[np.argmin(np.abs(q_val-Q_arr))]
+		q_cut[np.where(energies>kinematic_E)]=np.nan
+		err_cut[np.where(energies>kinematic_E)]=np.nan
+		I[i]=q_cut
+		err[i]=err_cut
+	out_MD.setSignalArray(I)
+	out_MD.setErrorSquaredArray(err**2)
+	return out_MD
+def csv_to_MD_mat(in_csv,q_arr,e_arr,skiprows=0,Ei=False,twoThetaMin=False,plot=False,transpose=False):
+	#Same as csv_to_MD but instead of the format being four columns, it's a matrix.
+	#The extents are defined by q_arr and e_arr which are in the format of [min,max]
+	in_dat = np.loadtxt(open(in_csv,'rb'),delimiter=',',skiprows=skiprows)
+	if transpose==True:
+		in_dat==np.transpose(in_dat)
+	q = np.linspace(q_arr[0],q_arr[1],np.shape(in_dat)[0])
+	e = np.linspace(e_arr[0],e_arr[1],np.shape(in_dat)[1])
+	Q,E = np.meshgrid(q,e)
+	I = in_dat.T 
+	#Make the mdhistoworkspace 
+	I_arr=I.flatten()
+	err_arr=I_arr/I_arr
+	extents_str = str(np.min(q))+','+str(np.max(q))+','+str(np.min(e))\
+						+','+str(np.max(e))
+	num_bin_str = str(len(np.unique(q)))+','+str(len(np.unique(e)))
+	out_ws = CreateMDHistoWorkspace(Dimensionality=2,Extents=extents_str,SignalInput=I_arr,\
+				ErrorInput=err_arr,NumberOfBins=num_bin_str,NumberOfEvents=np.ones(len(I_arr))\
+				,Names='Dim1,Dim2',Units='MomentumTransfer,EnergyTransfer')
+	return out_ws
+def scale_dftMD_to_highQ(md_obs,md_dft,qrange,erange,Ei,plot_fit=True,inputK=False,inputE=False,inputA=False,noscale=False):
+	#Function to try to correct for energy dependent errors in DFT calculations using a high Q
+	# measurement
+	md_obs = md_obs.clone()
+	md_dft = md_dft.clone()
+	dims_obs = md_obs.getNonIntegratedDimensions()
+	e_obs = mdu.dim2array(dims_obs[1])
+	eres = np.abs(e_obs[0]-e_obs[1])
+	e,i,err = cut_MDHisto_powder(md_obs,'DeltaE',[erange[0],erange[1],eres],[qrange[0],qrange[1]])
+	e2,i2,err2 = cut_MDHisto_powder(md_dft,'DeltaE',[erange[0],erange[1],eres],[qrange[0],qrange[1]])
+	Ei_arr = np.ones(len(e))*Ei
+	Ef_arr = np.ones(len(e))*Ei-e
+	lambda_i_list = np.sqrt(81.82/Ei_arr)
+	lambda_f_list = np.sqrt(81.82/Ef_arr)
+	ki_list = 2.0*np.pi/lambda_i_list
+	kf_list = 2.0*np.pi/lambda_f_list
+	def calc_I(I_dft,I_meas,A,T,Ei):
+		#Helper function only to be used in the dft scaling function.
+		#rescale I to have the correct energy dependence
+		K = (I_meas / (A*I_dft))*(1.0/(1.0+(ki_list**2 + kf_list**2)))
+		K = 1.0
+		I=I_dft*K
+		outI = I*T
+		outErr = err2*T
+		mc_term = (1.0-T)*(ki_list**2 + kf_list**2) * I       
+		total_I = (mc_term+outI)*A
+		return total_I
+	box_bragg = slice_box_QE_MD(md_obs,[0,4],[4,40]).clone()
+	box_dft = slice_box_QE_MD(md_dft,[0,4],[4,40]).clone()
+	mult_model = Model(calc_I,independent_vars=['I_dft','I_meas'])
+	params=mult_model.make_params()
+	#Fix A to be dsome input value if desired
+	if type(inputA)!=bool:
+		params.add('A',value=inputA,min=0.1,max=100.0,vary=False)
+	else:
+		params.add('A',value=6.0,min=0.1,max=100.0,vary=True)
+	params.add('T',value=1.0,min=0.9,max=1.1)
+	params.add('Ei',value=Ei,vary=False)
+	weights = 1.0/err
+	if type(inputK)== bool:
+		result = mult_model.fit(i,I_dft=i2,I_meas=i,params=params,weights=weights,method='powell')
+		T_result = result.params['T'].value
+		A_result = result.params['A'].value
+		#Get a list of scaling factors for every omega, rescale I_dft
+		K = (i/(A_result*i2))*(1.0/(T_result+(1.0-T_result)*(ki_list**2 + kf_list**2)))
+		#Finally, apply this scaling factor to the entire MD datset for every omega. Easiest to do by just making new 
+		#MDs with the regions of interest.
+	else:
+		e=inputE
+		K=inputK #For use with low temp measurements
+		T_result=1.0
+		A_result=1.0
+	newI = np.copy(box_dft.getSignalArray())
+	interp_K = scipy.interpolate.interp1d(x=e,y=K,bounds_error=False)
+	dims_new = box_dft.getNonIntegratedDimensions()
+	e_new = mdu.dim2array(dims_new[1])
+	scaled_i2 = np.copy(i2)
+	for ii in range(len(e_new)):
+		omega = e_new[ii]
+		K_omega = interp_K(x=omega)
+		#K_omega=1.0
+		if noscale!=True:
+			newI[:,ii]=newI[:,ii]*K_omega
+	if noscale!=True:
+		scaled_dft = T_result*i2*A_result*interp_K(e2)
+	else:
+		scaled_dft = i2*A_result
+	box_dft.setSignalArray(newI)
+	mc_term = (1.0-T_result)*(ki_list**2 + kf_list**2) * scaled_dft/T_result
+	if plot_fit==True and type(inputK)==bool:
+		print(result.fit_report())
+		fig,ax=plt.subplots(figsize=(8,5))
+		ax.errorbar(e,i,yerr=err,color='k',label='Data 300K',marker='o',capsize=3,ls='--')
+		ax.errorbar(e2,T_result*i2*A_result,yerr=err2,color='b',label='DFT 300K',marker='o',capsize=3,ls=' ')
+		ax.plot(e2,mc_term,'g',label='Multiple Scattering')
+		ax.plot(e2,scaled_dft,label='Renormalized DFT',color='b')
+		ax.plot(e2,mc_term+scaled_dft,label='Best fit',color='r')
+		ax.set_xlabel('E (meV)')
+		ax.legend()
+		ax.set_ylim(0,30)
+		ax.set_ylabel('I (barn/eV/fu/sr)')
+		ax.set_title('DFT F($\omega$) adjustment for E$_i$='+str(Ei)+' meV')
+	return box_dft,box_bragg,T_result,A_result,e2,interp_K(e2)
+
+def energyscale_MD(in_md,omegas,K):
+	#Scales an MD in energy by a given factor of K across the whole dataset.
+	work_MD = in_md.clone()
+	I = np.copy(work_MD.getSignalArray())
+	Err = np.sqrt(np.copy(work_MD.getSignalArray()))
+	dims = work_MD.getNonIntegratedDimensions()
+	e = mdu.dim2array(dims[1])
+	interpK = scipy.interpolate.interp1d(y=K,x=omegas,bounds_error=False)
+
+	for i in range(len(e)):
+		I[:,i]*=interpK(e[i])
+		Err[:,i]*=interpK(e[i])
+	work_MD.setSignalArray(I)
+	work_MD.setErrorSquaredArray(Err**2)
+	return work_MD
+
+def imitate_MD(md1,md2,mode='nearest-neighbor'):
+	#Given two mdhistoworkspaces, rescales md1 to the same dimensionality as md2 using a nearest neighbor approach
+	md_in = md1.clone()
+	md_highdim = md2.clone()
+	dims = md_in.getNonIntegratedDimensions()
+	q= mdu.dim2array(dims[0])
+	e= mdu.dim2array(dims[1])
+	Q,E = np.meshgrid(q,e)
+	outMD = md_in.clone()
+	ref_I = np.copy(md_in.getSignalArray())
+	out_I = outMD.getSignalArray()
+	out_I = out_I * np.nan
+	outMD.setSignalArray(out_I)
+	out_err = np.sqrt(np.copy(outMD.getErrorSquaredArray()))
+	out_err = out_err * np.nan
+	outMD.setErrorSquaredArray(out_err)
+	#Now we have an output mdhisto of the correct dimensionality consisting of only NaN values. 
+	dims2= md_highdim.getNonIntegratedDimensions()
+	q2 = mdu.dim2array(dims2[0])
+	e2 = mdu.dim2array(dims2[1])
+	I_orig = np.copy(md_highdim.getSignalArray())
+	Err_orig = np.sqrt(np.copy(md_highdim.getErrorSquaredArray()))
+	for i in range(len(q)):
+		for j in range(len(e)):
+			q_ind = np.argmin(np.abs(q2-q[i]))
+			e_ind = np.argmin(np.abs(e2-e[j]))
+			I_reference = ref_I[i,j]
+			I_nearest = I_orig[q_ind,e_ind]
+			Err_nearest = Err_orig[q_ind,e_ind]
+			if I_reference!=0 and not np.isnan(I_reference):
+				out_I[i,j]=I_nearest
+				out_err[i,j]=Err_nearest
+	errsqr = out_err**2
+	outMD.setSignalArray(out_I)
+	outMD.setErrorSquaredArray(errsqr)
+	return outMD
+
+def sub_nearest_MD(md_left,md_right,mode='subtract'):
+	#allows for subtraction of MDHistos with unequal bin sizes. Uses closest value in coarser grid.
+	out_MD = md_left.clone()
+	dims = out_MD.getNonIntegratedDimensions()
+	qLeft = mdu.dim2array(dims[0])
+	eLeft = mdu.dim2array(dims[1])
+
+	sub_dims = md_right.getNonIntegratedDimensions()
+	q_sub = mdu.dim2array(sub_dims[0])
+	e_sub = mdu.dim2array(sub_dims[1])
+
+	I_Left=np.copy(md_left.getSignalArray())
+	I_new = np.copy(I_Left)
+	Ierr_left = np.sqrt(np.copy(md_left.getErrorSquaredArray()))
+	new_err = np.copy(Ierr_left)
+	I_sub = np.copy(md_right.getSignalArray())
+	I_sub_err = np.sqrt(np.copy(md_right.getErrorSquaredArray()))
+	for i in range(len(qLeft)):
+		for j in range(len(eLeft)):
+			q_arg = np.argmin(np.abs(q_sub-qLeft[i]))
+			e_arg = np.argmin(np.abs(e_sub-eLeft[j]))
+			I_new[i,j]=I_Left[i,j]-I_sub[q_arg,e_arg]
+			err_sub = I_sub_err[q_arg,e_arg]
+			err_net = np.sqrt(Ierr_left[i,j]**2 + err_sub**2)
+			new_err[i,j]=err_net 
+	out_MD.setSignalArray(I_new)
+	out_MD.setErrorSquaredArray(new_err**2)
+	return out_MD
+
+
+
+def cut_MDHisto_powder(workspace_cut1D,axis,extents,integration_range, auto_plot=False, extra_text='',plot_min=0,plot_max=1e-4,debug=False):
+	#Takes an MD Histo and returns x, y for a cut in Q or E
+	#only for powder data
+	# Workspace - an mdhistoworkspace
+	# axis - |Q| or DeltaE (mev)
+	# extents - min, max, step_size for cut axis- array
+	# Integration range- array of min, max for axis being summed over
+
+	#Normalize by num events
+	sets = [workspace_cut1D]
+	intensities = np.copy(workspace_cut1D.getSignalArray())*1.
+
+	errors = np.sqrt(np.copy(workspace_cut1D.getErrorSquaredArray()*1.))
+	errors[np.isnan(intensities)]=1e30
+	#clean of nan values
+	intensities[np.isnan(intensities)]=0
+	if debug==True:
+		print('random row of intensities')
+		print(intensities[3])
+
+	dims = workspace_cut1D.getNonIntegratedDimensions()
+	q = mdu.dim2array(dims[0])
+	e = mdu.dim2array(dims[1])
+
+	if axis=='|Q|':
+		#First limit range in E
+		e_slice = intensities[:,np.intersect1d(np.where(e>=integration_range[0]),np.where(e<=integration_range[1]))]
+		slice_errs = errors[:,np.intersect1d(np.where(e>=integration_range[0]),np.where(e<=integration_range[1]))]
+		#Integrate over E for all values of Q
+		integrated_intensities = []
+		integrated_errs=[]
+		for i in range(len(e_slice[:,0])):
+			q_cut_vals = e_slice[i]
+			q_cut_err = slice_errs[i]
+
+			q_cut_err=q_cut_err[np.intersect1d(np.where(q_cut_vals!=0)[0],np.where(~np.isnan(q_cut_vals)))]
+			q_cut_vals=q_cut_vals[np.intersect1d(np.where(q_cut_vals!=0)[0],np.where(~np.isnan(q_cut_vals)))]
+
+
+			if len(q_cut_vals>0):
+				integrated_err=np.sqrt(np.nansum(q_cut_err**2))/len(q_cut_vals)
+				integrated_intensity=np.average(q_cut_vals,weights=1.0/q_cut_err)
+				integrated_errs.append(integrated_err)
+				integrated_intensities.append(integrated_intensity)
+			else:
+				integrated_err=0
+				integrated_intensity=0
+				integrated_errs.append(integrated_err)
+				integrated_intensities.append(integrated_intensity)
+
+		q_vals = q
+		binned_intensities = integrated_intensities
+		binned_errors = integrated_errs
+		bin_x = q_vals
+		bin_y = binned_intensities
+		bin_y_err = binned_errors
+		other = '$\hbar\omega$'
+		# Now bin the cut as specified by the extents array
+		extent_res = np.abs(extents[1]-extents[0])
+		bins = np.arange(extents[0],extents[1]+extents[2]/2.0,extents[2])
+		bin_x,bin_y,bin_y_err = bin_1D(q,bin_y,bin_y_err,bins,statistic='mean')
+	elif axis=='DeltaE':
+		#First restrict range across Q
+		q_slice = intensities[np.intersect1d(np.where(q>=integration_range[0]),np.where(q<=integration_range[1]))]
+		slice_errs = errors[np.intersect1d(np.where(q>=integration_range[0]),np.where(q<=integration_range[1]))]
+		#Integrate over E for all values of Q
+		integrated_intensities = []
+		integrated_errs=[]
+		for i in range(len(q_slice[0])):
+			e_cut_vals = q_slice[:,i]
+			e_cut_err = slice_errs[:,i]
+			e_cut_err = e_cut_err[np.intersect1d(np.where(e_cut_vals!=0)[0],np.where(~np.isnan(e_cut_vals)))]
+			e_cut_vals=e_cut_vals[np.intersect1d(np.where(e_cut_vals!=0)[0],np.where(~np.isnan(e_cut_vals)))]
+
+
+			if len(e_cut_vals)>0:
+				integrated_err=np.sqrt(np.nansum(e_cut_err**2))/len(e_cut_vals)
+				integrated_intensity=np.average(e_cut_vals,weights=1.0/e_cut_err)
+				integrated_errs.append(integrated_err)
+				integrated_intensities.append(integrated_intensity)
+			else:
+				integrated_errs.append(0)
+				integrated_intensities.append(0)
+		bin_x = e
+		bin_y = integrated_intensities
+		bin_y_err = integrated_errs
+
+		bins = np.arange(extents[0],extents[1]+extents[2]/2.0,extents[2])
+		bin_x,bin_y,bin_y_err = bin_1D(e,bin_y,bin_y_err,bins,statistic='mean')
+		other = '|Q|'
+	else:
+		print('Invalid axis option (Use \'|Q|\' or \'DeltaE\')')
+		return False
+	if auto_plot==True:
+		#Attempts to make a plot of the cut. Limits and such will be off
+
+		cut_fig, cut_ax = plt.subplots(1,1,figsize=(8,6))
+		cut_ax.set_title(axis+' Cut')
+		cut_ax.set_xlabel(axis)
+		cut_ax.set_ylabel('Intensity (arb.)')
+		cut_ax.errorbar(x=bin_x,y=bin_y,yerr=bin_y_err,marker='o',color='k',ls='--',mfc='w',mec='k',mew=1,capsize=3)
+		cut_ax.set_ylim(np.nanmin(bin_x)*0.8,np.nanmax(bin_y)*1.5)
+		cut_ax.text(0.7,0.95,other+'='+str(integration_range),transform=cut_ax.transAxes)
+		cut_ax.text(0.7,0.85,extra_text,transform=cut_ax.transAxes)
+		cut_fig.show()
+
+	return np.array(bin_x),np.array(bin_y),np.array(bin_y_err)
+
+
+def slice_box_QE_MD(input_md,qlim,elim):
+	#Given limits that the user wants to keep, returns a new workspace with only the selected box
+	working_MD = input_md.clone()
+	dims=working_MD.getNonIntegratedDimensions()
+	q = mdu.dim2array(dims[0])
+	e = mdu.dim2array(dims[1])
+	I= np.copy(working_MD.getSignalArray())
+	err = np.sqrt(np.copy(working_MD.getErrorSquaredArray()))
+	qmin= qlim[0]
+	qmax = qlim[1]
+	emin=elim[0]
+	emax=elim[1]
+	working_MD = mask_QE_box_MD(working_MD,[np.min(q),np.max(q)],[np.min(e),emin]).clone()
+	working_MD = mask_QE_box_MD(working_MD,[np.min(q),qmin],[np.min(e),np.max(e)]).clone()
+	working_MD = mask_QE_box_MD(working_MD,[np.min(q),np.max(q)],[emax,np.max(e)]).clone()
+	working_MD = mask_QE_box_MD(working_MD,[qmax,np.max(q)],[np.min(e),np.max(e)]).clone()
+	# For efficienty now we don't need the rest of the data. 
+	return working_MD
+
+
+
+def mask_QE_box_MD(input_md,qlim,elim):
+	#given limits in Q, E, masks an MDHistoworkspace. Useful for masking regions with bad data.
+	working_MD = input_md.clone()
+	dims = working_MD.getNonIntegratedDimensions()
+	q = mdu.dim2array(dims[0])
+	e = mdu.dim2array(dims[1])
+	I = np.copy(working_MD.getSignalArray())
+	err = np.sqrt(np.copy(working_MD.getErrorSquaredArray()))
+	qmin=qlim[0]
+	qmax=qlim[1]
+	emin=elim[0]
+	emax=elim[1]
+
+	for i in range(len(I[:,0])):
+		for j in range(len(I[0])):
+			point = I[i,j]
+			q_curr = q[i]
+			e_curr = e[j]
+			if q_curr<=qmax and q_curr>=qmin and e_curr<=emax and e_curr>=emin :
+				#In the 'box'
+				I[i,j]=np.nan
+				#Don't touch the error- should be effectively inf but we'll leave it alone.
+				err[i,j]=np.inf
+	working_MD.setSignalArray(I)
+	working_MD.setErrorSquaredArray(err**2)
+	return working_MD
+
+
+
+def MDfactorizationv2(workspace_MDHisto,mag_ion='Ir4',q_lim=False,e_lim=False,Ei=50.0,twoThetaMin=3.5,plot_result=True,method='powell',fname='placeholder.jpg',\
+						fast_mode=False,overwrite_prev=False,allow_neg_E=True,g_factor=2.0,debug=False,fix_Qcut=False,fix_Ecut=False):
+	#Does a rocking curve foreach parameter to determine its uncertainty
+	#Assumes that z is already flatted into a 1D array
+	#This is specifically for the factorization technique
+	#below contents are from old version of function 
+
+	#Version 2 includes an updated definition of F(omega)
+	if overwrite_prev==True and os.path.exists(fname):
+		#Delete the file
+		os.remove(fname)
+
+	dims = workspace_MDHisto.getNonIntegratedDimensions()
+	q_values = mdu.dim2array(dims[0])
+	energies = mdu.dim2array(dims[1])
+	intensities = np.copy(workspace_MDHisto.getSignalArray())
+	errors = np.sqrt(np.copy(workspace_MDHisto.getErrorSquaredArray()))
+	if q_lim!=False and e_lim!=False:
+		qmin=q_lim[0]
+		qmax=q_lim[1]
+		emin=e_lim[0]
+		emax=e_lim[1]
+	elif q_lim==False and e_lim!=False:
+		#e_lim has not been defined.
+		qmin=np.min(q_values)
+		qmax=np.max(q_values)
+		emin=e_lim[0]
+		emax=e_lim[1]
+	elif e_lim!=False and q_lim==False:
+		#q-lim hasn't been defined
+		qmin=q_lim[0]
+		qmax=q_lim[1]
+		emin=np.min(energies)
+		emax=np.max(energies)
+	else:
+		qmin=np.min(q_values)
+		qmax=np.max(q_values)
+		emin=np.min(energies)
+		emax=np.max(energies)
+
+	intensities = intensities[np.intersect1d(np.where(q_values>=qmin),np.where(q_values<=qmax))]
+	intensities = intensities[:,np.intersect1d(np.where(energies>=emin),np.where(energies<=emax))]
+	errors = errors[np.intersect1d(np.where(q_values>=qmin),np.where(q_values<=qmax))]
+	errors = errors[:,np.intersect1d(np.where(energies>=emin),np.where(energies<=emax))]
+	energies = energies[np.intersect1d(np.where(energies>=emin),np.where(energies<=emax))]
+	q_values = q_values[np.intersect1d(np.where(q_values>=qmin),np.where(q_values<=qmax))]
+
+	#Remove areas outside of kinematic limit of SEQ 
+	#This is outside of the scope of the script.
+	if twoThetaMin!=False and Ei!=False:
+		if twoThetaMin!=False and (type(Ei) != list):
+			Q_arr,E_max = minQseq(Ei,twoThetaMin)
+		elif type(Ei)!=list:
+			Q_arr,E_max = minQseq(Ei,twoThetaMin)
+				
+		if type(Ei)==list:
+			Q_arr,E_max = minQseq_multEi(Ei,twoThetaMin)
+		for i in range(len(intensities)):
+			q_cut = intensities[i]
+			q_val = q_values[i]
+			err_cut = errors[i]
+			kinematic_E = E_max[np.argmin(np.abs(q_val-Q_arr))]
+			q_cut[np.where(energies>kinematic_E)]=np.nan
+			err_cut[np.where(energies>kinematic_E)]=np.nan
+			intensities[i]=q_cut
+			errors[i]=err_cut
+	
+
+
+	x = q_values
+	y = energies
+	z = intensities
+	bad_i = np.isnan(z)
+	intensities[np.isnan(z)]=0
+	errors[np.isnan(z)]=1e10
+	errors[errors==0]=1e10
+	errors[np.isnan(errors)]=1e10
+
+	#Take big cuts of the dataset to get a good guess
+	q_res = np.abs(q_values[1]-q_values[0])
+	e_res = np.abs(energies[1]-energies[0])
+	
+	q_vals_guess = np.copy(x)
+	q_cut_guess = np.zeros(len(x))
+	q_cut_guess_errs=np.zeros(len(x))
+	e_cut_guess = np.zeros(len(y))
+	e_cut_guess_errs = np.zeros(len(y))
+	for i in range(len(q_cut_guess)):
+		q_i = intensities[i,:]
+		qerr_i = errors[i,:]
+		qpt = np.average(q_i,weights=1.0/qerr_i)
+		q_cut_guess[i]=qpt 
+		q_cut_guess_errs[i]=qpt*np.mean(q_i/qerr_i)
+	for i in range(len(e_cut_guess)):
+		e_i = intensities[:,i]
+		eerr_i = errors[:,i]
+		ept=np.average(e_i,weights=1.0/eerr_i)
+		e_cut_guess[i]=ept 
+		e_cut_guess_errs[i]=ept*np.mean(e_i/eerr_i)
+	
+	#q_vals_guess,q_cut_guess,q_cut_guess_errs = cut_MDHisto_powder(workspace_MDHisto,'|Q|',[np.nanmin(x)-q_res/2.0,np.nanmax(x)+q_res/2.0,q_res/10.0],e_lim)
+	#e_vals_guess,e_cut_guess,e_cut_guess_errs = cut_MDHisto_powder(workspace_MDHisto,'DeltaE',[np.nanmin(y)-e_res/2.0,np.nanmax(y)+e_res/2.0,e_res/10.0],q_lim)
+
+	e_vals_guess = y 
+	q_vals_guess = x
+	#Normalize the cuts to one in energy
+	e_cut_guess[np.where(e_cut_guess<=0)[0]]=1e-2
+	e_cut_integral = np.trapz(x=y,y=e_cut_guess)
+	print('Gw integral')
+	print(e_cut_integral)
+	e_cut_guess/=e_cut_integral
+	q_cut_guess*=e_cut_integral
+	#Convert the actual cut into deltas used in the expoential definition of G(omega)
+	#We do this by defining the delta at the first value in the cut to be zero. 
+	g_omega_0 = e_cut_guess[0]
+	delta_0 = 0.0
+	Z = 1.0/g_omega_0 #This is used to solve for delta now. 
+	delta_arr = np.zeros(len(e_cut_guess))
+	delta_arr = np.log(1.0/e_cut_guess*Z)
+	calc_ecut_guess = np.exp(-1.0*delta_arr)/Z
+
+	m = len(y) # number of E-values
+	n = len(x) #number of q_values
+	#e_cut_guess/=e_cut_guess[0]
+	#q_cut_guess*=e_cut_guess[0]
+	Q_cut = q_cut_guess.reshape(1,n)
+	E_cut = e_cut_guess.reshape(m,1)
+	xy=Q_cut*E_cut
+	arr_guess = np.append(q_cut_guess,delta_arr)
+	arr_guess[np.isnan(arr_guess)]=0
+	params= Parameters()
+	for i in range(len(arr_guess)):
+		val = arr_guess[i]
+		if i>=n:
+			#Spectral weight can't be negative physically
+			#Need to fix the first energy value 
+			if i==n:
+				vary_val = False
+				param_guess = 0.0
+			else:
+				if fix_Ecut==True:
+					vary_val=False
+				else:
+					vary_val=True
+				param_guess = arr_guess[i]
+			#From of G(w) is e^(-delta), e^-15 is 1e-7
+			params.add('param_'+str(i),vary=vary_val,value=param_guess,max=15.0)
+		else:
+			if fix_Qcut == True:
+				vary_val=False
+			else:
+				vary_val=True
+			params.add('param_'+str(i),value=val,vary=vary_val)
+	if debug==True:
+		plt.figure()
+		plt.errorbar(x,q_cut_guess,q_cut_guess_errs,color='k')
+		plt.show()
+		plt.figure()
+		plt.errorbar(y,calc_ecut_guess,e_cut_guess_errs,color='k')
+		plt.errorbar(y,e_cut_guess,e_cut_guess_errs,color='r')
+		plt.show()
+
+	weights = np.ones(np.shape(intensities))
+	weights = 1.0/(np.abs(errors))
+
+	#Make note of q, e indices at which there exist no intensities. They will be masked.
+	bad_q_i=[]
+	bad_e_i=[]
+	for i in range(np.shape(intensities)[0]):
+		#Check Q-cuts
+		q_cut = intensities[i]
+		num_nan = np.sum(np.isnan(q_cut))
+		num_zero = np.sum([q_cut==0])
+		num_bad = num_nan+num_zero
+		if num_bad==len(q_cut):
+			bad_q_i.append(i)
+		else:
+			#Do nothing
+			pass
+	#Some high energies will also have no counts from detailed balance
+	for i in range(np.shape(intensities)[1]):
+		e_cut = intensities[:,i]
+		num_nan = np.sum(np.isnan(e_cut))
+		num_zero = np.sum([e_cut==0])
+		num_bad =num_nan+num_zero
+		if num_bad==len(e_cut):
+			bad_e_i.append(i)
+		else:
+			#Do nothing
+			pass
+	weights=np.ravel(weights)
+	meas_errs=1.0 / weights 
+
+	z_fit = np.copy(intensities)
+	Q,E = np.meshgrid(e_vals_guess,q_vals_guess)
+	z_fit_orig = np.copy(z_fit)
+	z_fit = z_fit.flatten()
+	#weights[z_fit==0]=0
+	meas_errs[np.isnan(z_fit)]=np.inf
+
+	z_fit[np.isnan(z_fit)]=np.nan
+
+	xy = np.arange(z_fit.size)
+	num_points = len(z_fit) - np.sum(np.isnan(z_fit)) - np.sum([z_fit==0])
+	vals = []
+	for i in range(len(params)):
+		vals.append(params['param_'+str(i)].value)
+	vals = np.array(vals)
+	Q_vals = vals[0:n].reshape(n,1) #Reconstruct y coordinates
+	E_vals = vals[n:].reshape(1,m) # '' x coord
+	slice2D = Q_vals * E_vals
+
+
+	weights = 1.0/meas_errs
+	data = z_fit 
+	data[np.isnan(data)]=0
+	weights[data==0]=0
+	meas_errs=1.0/weights 
+	meas_errs[weights==0]=np.nan
+	model = Model(factorization_f,independent_vars=['n','m','delE'])
+	eRes = np.abs(energies[1]-energies[0])
+	#minimize this chisqr function. 
+	result = model.fit(data,n=n,m=m,delE=eRes,params=params,method=method,weights=weights,nan_policy='omit')
+	f_array=[]
+	for i in range(len(result.params)):
+		f_array.append(result.params['param_'+str(i)].value)
+
+
+	num_operations=len(params)
+	#Normalize s.t. energy spectra integrates to one
+	q = q_values
+	e = energies
+	x_q = np.array(f_array[0:n])
+	x_q[bad_q_i]=0
+	deltas = np.array(f_array[n:])
+	Z = np.nansum(np.exp(-1.0*deltas))
+	g_e = np.exp(-1.0*deltas)/(eRes*Z) 
+	if os.path.isfile(fname) or fast_mode==True:
+		if fast_mode==True:
+			err_array =0.3*np.array(f_array)
+		else:
+			err_dict = np.load(fname,allow_pickle=True).item()
+			err_array=[]
+			for i in range(len(err_dict.keys())):
+				key = 'param_'+str(i)
+				err_array.append(err_dict[key])
+		x_q_errs = err_array[0:n]
+		delta_errs = err_array[n:]
+		#Need to normalize
+
+		#Normalize s.t. energy spectra integrates to one
+		q = q_values
+		e = energies
+		x_q = np.array(f_array[0:n])
+		x_q[bad_q_i]=0
+		deltas = np.array(f_array[n:])
+		Z = np.nansum(np.exp(-1.0*deltas))
+		g_e = np.exp(-1.0*deltas)/(eRes*Z) 
+
+		xq_err = err_array[0:n]
+		ge_err = err_array[n:]
+
+		x_q,g_e,xq_err,ge_err = np.array(x_q),np.array(g_e),np.array(xq_err),np.array(ge_err)
+
+		#Now convert X(Q) into S(Q)
+		r0 = 0.5391
+		g=g_factor
+		q_FF,magFF = get_MANTID_magFF(q,mag_ion)
+		magFFsqr = 1.0/np.array(magFF)
+		s_q = (2.0*x_q)/(r0**2 * g**2 * magFFsqr)
+		s_q_err = (2.0*xq_err)/(r0**2 * g**2 * magFFsqr)
+		return q,s_q,s_q_err,e,g_e,ge_err
+	#Get error bars using random sampling method
+	#Create a parameter object mased on linearized form of the factorization for uncertainty
+
+	err_dict = calculate_param_uncertainty(data,meas_errs,model,result.params,result,fast_calc=fast_mode,independent_vars={'n':n,'m':m,'delE':eRes},\
+		extrapolate=True,show_plots=True,fname=fname,overwrite_prev=overwrite_prev,num_test_points = 20,debug=False,fit_method=method)
+	err_array = []
+	for i in range(len(result.params)):
+		f_array.append(result.params['param_'+str(i)].value)
+		err_array.append(err_dict['param_'+str(i)])
+	err_array=np.array(err_array)
+	num_operations=len(params)
+	#Translate delta values to g_e
+	#Z = np.nansum(np.exp(-1.0*np.array(f_array[n:])))
+	#g_e = np.exp(-1.0*np.array(f_array[n:]))
+	q = q_values
+	e = energies
+	x_q = np.array(f_array[0:n])
+	x_q[bad_q_i]=0
+	g_e[bad_e_i]=0
+	g_e[np.isnan(g_e)]=0
+	x_q[np.isnan(x_q)]=0
+	ge_int = np.trapz(g_e,x=energies)
+	xq_err = err_array[0:n]
+	delta_err = np.array(err_array[n:])
+	ge_err = g_e*np.array(deltas)*(delta_err/np.array(deltas))
+
+	x_q = np.array(x_q)
+	xq_err = np.array(xq_err)
+	g_e = np.array(g_e)
+	ge_err = np.array(ge_err)
+	#Now convert X(Q) into S(Q)
+	r0 = 0.5391
+	g=g_factor
+	q_FF,magFF = get_MANTID_magFF(q,mag_ion)
+	magFFsqr = 1.0/np.array(magFF)
+	s_q = (2.0*x_q)/(r0**2 * g**2 * magFFsqr)
+	s_q_err = (2.0*xq_err)/(r0**2 * g**2 * magFFsqr)
+	if plot_result==True:
+		try:
+			plt.figure()
+			plt.errorbar(q,s_q*magFFsqr,yerr=s_q_err*magFFsqr,capsize=3,ls=' ',mfc='w',mec='k',color='k',marker='',label=r'S(Q)|M(Q)|$^2$')
+			plt.errorbar(q,s_q,yerr=xq_err,capsize=3,ls=' ',mfc='w',mec='b',color='b',marker='',label=r'S(Q)')
+			plt.legend()
+			plt.title('S(Q) Factorization Result')
+			plt.xlabel('Q($\AA^{-1}$))')
+			plt.ylabel('S(Q) barn/mol/f.u.')
+			plt.figure()
+			plt.title('G($\omega$) Factorization Result')
+			plt.xlabel('$\hbar$\omega (meV)')
+			plt.ylabel('G($\omega$) (1/meV)')
+			plt.errorbar(energies,g_e,yerr=ge_err,capsize=3,ls=' ',mfc='w',mec='k',color='k',marker='')
+		except Exception as e:
+			print('Error when trying to plot result:')
+			print(e)
+	#Finally, save result
+
+	return q,s_q,s_q_err,e,g_e,ge_err
+
+
+
+def calculate_param_uncertainty(obs_vals,obs_errs,model,params,result,independent_vars=False,fast_calc=False,extrapolate=False,show_plots=True,fname='test.jpg',overwrite_prev=False,num_test_points = 30,debug=False,fit_method='powell'):
+	'''
+	This is a function to calculate the uncertainties in the free parameters of any lmfit model.
+	It assumes a parabolic form, and takes the following arguments:
+		obs_vals- np array - experimental values of the function
+		obs_errs- np array - experimental errors of the function
+		model - lmfit model describing the fitting function
+		params - lmfit parameter object
+		result - lmfit results of the best fit for the function
+		indpendent_vars- bool or dict - if the model requires indepenedent vars, they are included here in the form a dictionary (i.e. independent_vars={'x':x,'y',y} in the function call)
+		fast_calc - bool - spits out values if just testing and don't need to evaluate perfectly.
+		extrapolate -bool- assumes a parabolic form for chisqr and gets uncertainties based around that. 
+		show_plots - bool - shows the parabolic fits or the raw calculations
+		fname - string- filename to store results 
+		overwrite_prev- bool - determines if previous results should be loaded from file or overwritten. 
+
+	Returns a dictionary of param names and errors
+	'''
+	#First step is to check if the parameters already exist.
+	if os.path.isfile(fname) and overwrite_prev==True:
+		os.remove(fname)
+	if os.path.isfile(fname) and overwrite_prev!=True:
+		errors=np.load(fname,allow_pickle=True).item()
+		return errors
+	if fast_calc==True:
+		errs={}
+		for param in result.params:
+			errs[param]=result.params[param].value*0.2
+		return errs 
+	#Get an initial value of chisqr
+	obs_errs[obs_errs==0]=np.nan 
+	obs_errs[np.isnan(obs_errs)]=np.inf
+	obs_vals[obs_vals==0]=0
+	obs_vals[np.isnan(obs_vals)]=0
+	chisqr0=calc_chisqr_val(obs_vals,result.best_fit,obs_errs)
+	#Get the number of free parameters in the fit:
+	num_free_params=0
+	for param in result.params:
+		if result.params[param].vary==True:
+			num_free_params+=1
+	#Get the number of points being fit
+	num_points = np.nansum([obs_errs<1e10])
+	#Calculate the statistical min and max allowed values of chisqr
+	chisqrmin=chisqr0/(1.0+1.0/(num_points-num_free_params))
+	chisqrmax=chisqr0/(1.0-1.0/(num_points-num_free_params))
+	if debug==True:
+		print('Chisqr0='+str(chisqr0))
+		print('Chisqrmax='+str(chisqrmax))
+	#Calculated errors will be returned in this dictionary:
+	err_out = {}
+	#Evaluated points will be kept track of in a param val list and a chisqr list
+
+	progress = ProgressBar(num_free_params, fmt=ProgressBar.FULL) #I like a progress bar
+	#Now we run into the problem of which points to test. This needs to be an adaptive process. 
+	'''
+	General algorithm for which points to test is the following:
+	1. Set a min/max param value based on a percent error, noting that near zero a pure percent error will fail. 
+	2. Test each of these points. If they are above the max value, then reduce the percent error by a factor of two. 
+			If they are below the max value, then increase the percent error by a factor of two. 
+			This should result in wide adaptability for ranges of fit parameters. 
+	3. Once the two border points have been found (the points directly above and below the max chisqr)
+		see if the number of evaluated points is acceptable. If not, fill in the parameter space between the points 
+		uniformly to find an acceptable number of points. 
+	4. Once a suitable number of points have been evaluated, perform a parabolic fit to determine the error bar if desired.
+	5. If the parabolic fit is not performed, then the error bar is taken as half the distance between the min/max points.
+
+	'''
+	#Iterate through each parameter to do this 
+	weights = 1.0 / obs_errs
+	prev_slope = False
+	for param in result.params:
+		affect_chisqr=True
+		try:
+			if result.params[param].vary==True:
+				print('Evaluating Uncertainty for '+str(param))
+				found_min = False 
+				found_max = False
+				min_i = 0.0
+				max_i = 0.0
+				#Evaluated points will be kept track of in a param val list and a chisqr list
+				param_list=[]
+				chisqr_list = []
+				init_param_val = result.params[param].value
+				if debug==True:
+					print('Init param val')
+					print(init_param_val)
+				#param_list.append(init_param_val)
+				#chisqr_list.append(chisqr0)
+				opt_val = init_param_val
+				new_min_chisqr_prev = 0.0
+				while found_min==False and min_i<1e2:
+					new_params_min=result.params.copy()
+					min_param_val = init_param_val - np.abs(init_param_val*(2.0**min_i)*0.005) #Start with a small 0.5% error 
+					new_params_min.add(param,vary=False,value=min_param_val)
+					if type(independent_vars)==bool:
+						new_result_min=model.fit(obs_vals,params=new_params_min,nan_policy='omit',method='powell',weights=weights)
+					else:
+						new_result_min=model.fit(obs_vals,params=new_params_min,nan_policy='omit',method='powell',weights=weights,**independent_vars)
+					#Get the chisqr after fitting the new param
+					new_min_chisqr = calc_chisqr_val(obs_vals,new_result_min.best_fit,obs_errs)
+					if new_min_chisqr>chisqrmax:
+						found_min=True #We are free
+					if new_min_chisqr<new_min_chisqr_prev:
+						#Jumped out of a local minima, need to break. Do not append these points to the array
+						found_min=True
+					else:
+						param_list.append(min_param_val)
+						chisqr_list.append(new_min_chisqr)
+
+						min_i = min_i+1.0
+						if debug==True: 
+							print(min_i)
+							print('Curr chisqr: '+str(new_min_chisqr))
+							print('Max chisqr: '+str(chisqrmax))
+						if new_min_chisqr==new_min_chisqr_prev and min_i>4:
+							print('Param '+str(param)+' does not affect chisqr.')
+							found_min=True
+							affect_chisqr=False
+						new_min_chisqr_prev=new_min_chisqr
+				new_max_chisqr_prev=0.0
+				while found_max==False and max_i<1e2:
+					new_params_min=result.params.copy()
+					max_param_val = init_param_val + np.abs(init_param_val*(2.0**max_i)*0.005)
+					new_params_max=result.params.copy()
+					new_params_max.add(param,vary=False,value=max_param_val)
+					if type(independent_vars)==bool:
+						new_result_max=model.fit(obs_vals,params=new_params_max,nan_policy='omit',method='powell',weights=weights)
+					else:
+						new_result_max=model.fit(obs_vals,params=new_params_max,nan_policy='omit',method='powell',weights=weights,**independent_vars)            
+					#Get the chisqr after fitting the new param
+					new_max_chisqr = calc_chisqr_val(obs_vals,new_result_max.best_fit,obs_errs)
+					if new_max_chisqr>chisqrmax:
+						found_max=True 
+					if new_max_chisqr<new_max_chisqr_prev:
+						#Jumped out of local minima, function is not well behaved.
+						found_max=True
+					else:
+						param_list.append(max_param_val)
+						chisqr_list.append(new_max_chisqr)
+
+						if new_max_chisqr==new_max_chisqr_prev and max_i>4:
+							print('Param '+str(param)+' does not affect chisqr.')
+							affect_chisqr=False
+							found_max=True
+						max_i = max_i+1
+						if debug==True: 
+							print(max_i)
+							print('Curr chisqr: '+str(new_max_chisqr))
+							print('Max chisqr: '+str(chisqrmax))
+						new_max_chisqr_prev=new_max_chisqr
+				if found_min==False or found_max==False:
+					print('WARNING- strange behavior in uncertainty calculation, enbable show_plots==True to assure correctness')
+				#Supposedly they have both been found. Check the number of points. if the estimate was initially way too large, then we need to fill them in . 
+				num_eval_points = np.sum([np.array(chisqr_list)<chisqrmax])
+				max_point = np.max(param_list)
+				min_point = np.min(param_list)
+				if debug==True:
+					print('Max Point: ')
+					print(max_point)
+					print('Min point: ')
+					print(min_point)
+					print('Num eval points:')
+					print(num_eval_points)
+				while num_eval_points<num_test_points:
+					#Evaluate the remainder of points in an evenly spaced fashion
+					num_new_points = int(1.5*(num_test_points-num_eval_points))
+					#fill_points = np.linspace(min_point,max_point,num_new_points)
+					fill_points = np.random.uniform(low=min_point,high=max_point,size=num_new_points)
+					for param_val in fill_points:
+						new_params=result.params.copy()
+						new_params.add(param,vary=False,value=param_val)
+						if type(independent_vars)==bool:
+							new_result=model.fit(obs_vals,params=new_params,nan_policy='omit',method='powell',weights=weights)
+						else:
+							new_result=model.fit(obs_vals,params=new_params,nan_policy='omit',method='powell',weights=weights,**independent_vars)            
+						#Get the chisqr after fitting the new param
+						new_chisqr = calc_chisqr_val(obs_vals,new_result.best_fit,obs_errs)
+						param_list.append(param_val)
+						chisqr_list.append(new_chisqr)
+					#number of ponts below chisqrmax is the num_eval points
+					num_eval_points = np.sum([np.array(chisqr_list)<chisqrmax])
+					#num_eval_points == 0 or 1 is a special case. 
+					good_param_vals_i = np.where(np.array(chisqr_list)<chisqrmax)[0]
+					good_param_vals = np.array(param_list)[good_param_vals_i]
+					if num_eval_points>1:
+						max_point = np.max(good_param_vals)
+						min_point = np.min(good_param_vals)
+					else:
+						minus_points_i = [param_list<opt_val]
+						minus_points = np.array(param_list)[minus_points_i]
+						min_point = np.max(minus_points)
+						plus_points = np.array(param_list)[param_list>opt_val]
+						max_point = np.max(plus_points)
+						if debug==True:
+							print('new min point')
+							print(min_point)
+							print('new max point')
+							print(max_point)
+					if num_eval_points<num_test_points:
+						print('Insufficient number of points under max chisqr. Recursively iterating.')
+						print('Good points: '+str(num_eval_points)+'/'+str(num_test_points))
+				#In theory should have all points needed to get uncertainties now.
+				chisqr_list = np.array(chisqr_list)
+				param_list = np.array(param_list) 
+
+				#If there are new points that have a lower chisqr than the initial fit, 
+				#   adjust the maxchisqr now or the error will be artificially large.
+				min_eval_chisqr =  param_list[np.argmin(chisqr_list)]
+				if min_eval_chisqr<chisqr0-np.abs(chisqr0-chisqrmax)/2.0:
+					print('WARNING: Local minima found that is different from initial value.')
+					print('Enable show_plots=True and check quality of initial fit.')
+					opt_val = param_list[np.argmin(chisqr_list)]
+					opt_chisqr  = np.mean([chisqr0,np.min(chisqr_list)])
+				else:
+					opt_chisqr = chisqr0 
+					opt_val = init_param_val 
+				temp_chisqrmin=opt_chisqr/(1.0+1.0/(num_points-num_free_params))
+				temp_chisqrmax=opt_chisqr/(1.0-1.0/(num_points-num_free_params))  
+				if extrapolate==True:
+					def parabola(x,a,b,c):
+						return a*((x-b)**2)+c
+					para_model = Model(parabola)
+					para_params = para_model.make_params()
+					#very roughly assume it's linear between 0 and 1 points
+					if prev_slope==False:
+						guess_slope=np.abs(temp_chisqrmax-chisqr0)/(((np.nanmax(np.array(param_list))-opt_val)**2))
+					else:
+						guess_slope = prev_slope
+					para_params.add('a',value=guess_slope,min=0,max=1e8)
+					para_params.add('b',vary=False,value=opt_val) #Should just be hte optimum value
+					para_params.add('c',vary=True,value=chisqr0,min=chisqr0-0.1,max=chisqrmax)
+					para_weights = np.ones(len(chisqr_list))
+					#weight by distance from optimum value?
+					para_weights = np.exp(-1.0*(np.abs(param_list-opt_val))/np.abs(opt_val))
+					para_fit = para_model.fit(chisqr_list,x=param_list,params=para_params,method='powell',weights=para_weights)
+					a_fit = para_fit.params['a'].value
+					b_fit = para_fit.params['b'].value
+					c_fit = para_fit.params['c'].value
+					prev_slope = a_fit
+					max_param_val = np.sqrt(np.abs((temp_chisqrmax-c_fit)/a_fit))+b_fit
+					#print('Max param_val='+str(max_param_val))
+					error = np.abs(max_param_val-b_fit)
+					opt_val=b_fit
+					eval_range = np.linspace(opt_val-error*1.2,opt_val+error*1.2,3000)
+					fit_eval = para_model.eval(x=eval_range,params=para_fit.params)
+					if affect_chisqr==True:
+						err_out[param]=error
+					else:
+						err_out[param]=np.nanmean(param_list)/np.sqrt(len(param_list))
+				else:
+					good_param_val_i = [np.array(chisqr_list)<temp_chisqrmax]
+					good_param_vals = param_list[good_param_val_i]
+					error = np.abs(np.max(good_param_vals)-np.min(good_param_vals))/2.0
+					if affect_chisqr==True:
+						err_out[param]=error
+					else:
+						err_out[param]=np.nanmean(param_list)/np.sqrt(len(param_list))            
+				if show_plots==True:
+					try:
+						plt.figure()
+						plt.plot(param_list,chisqr_list,color='k',marker='o',ls='')
+						plt.xlabel('Param val')
+						plt.ylabel('Chisqr')
+						plt.title('Uncertainty '+str(param)+ ' Error ='+str(round(error,3))+' or '+str(round(100*error/opt_val,3))+'%')
+						#plt.xlim(np.min(test_value_arr)-np.abs(np.min(test_value_arr))/10.0,np.max(test_value_arr)*1.1)
+						plt.plot(np.linspace(np.min(param_list),np.max(param_list)+1e-9,10),np.ones(10)*np.abs(temp_chisqrmax),'r')
+						if extrapolate==True:
+							plt.plot(eval_range,fit_eval,'b--')
+						plt.plot(opt_val+error,temp_chisqrmax,'g^')
+						plt.plot(opt_val-error,temp_chisqrmax,'g^')
+						plt.ylim(np.min(chisqr_list)-np.abs(np.abs(temp_chisqrmax)-np.min(chisqr_list))/3.0,np.abs(temp_chisqrmax)+np.abs(np.abs(temp_chisqrmax)-np.min(chisqr_list))/3.0)
+						#plt.xlim(0.9*np.min(test_value_arr),np.max(test_value_arr)*1.1)
+						plt.show()
+					except Exception as e:
+						print('Some error while plotting.')
+						print(e)
+					#plt.ylim(0.0,1.3*np.abs(chisqrmax))
+				progress.current+=1
+				progress()
+			else:
+				err_out[param]=0.0
+		except Exception as e:
+			err_out[param]=0
+			print('Warning: Error when evaluating uncertainty. ')
+			tb_str = traceback.format_exception(etype=type(e), value=e, tb=e.__traceback__)
+			print(tb_str)
+	#Save to a file
+	np.save(fname,err_out)
+	return err_out
+
+def factorization_f(n,m,delE,**vals):
+	#Returns flattened calculated spectra from factorization
+	vals_arr = []
+	for i in range(len(vals)):
+		vals_arr.append(vals['param_'+str(i)])
+	vals = np.array(vals_arr)
+	Q_vals = vals[0:n].reshape(n,1) #Reconstruct y coordinates
+	#Update to this function means that these are delta vals in e^(-delta_i)/Z
+	deltas = vals[n:]
+	Z = np.nansum(np.exp(-1.0*deltas))
+	E_vals = np.exp(-1.0*deltas)/(delE*Z) 
+
+	E_vals = E_vals.reshape(1,m) # '' x coord
+
+	slice2D = Q_vals * E_vals
+
+	calcI = slice2D.flatten()
+	#chisqr = np.nansum((z_fit - calcI)**2 / (meas_errs**2))/num_points
+	return calcI
+def uncertainty_determination(fit_params,z_test,obs_errs,model,result,independent_var_arr=False,fast_mode=False,extrapolate=False,show_plots=False,fname='placeholder.jpg',overwrite_prev=False,num_chisqr_test_points=30):
+	#Does a rocking curve foreach parameter to determine its uncertainty
+	#Assumes that z is already flatted into a 1D array
+	print('WARNING: this call is outdated. Use THfuncs.calculate_param_uncertainty instead.')
+	errs = calculate_param_uncertainty(z_test,1.0 / obs_errs,model,fit_params,result,independent_vars=independent_var_arr,fast_calc=fast_mode,extrapolate=extrapolate,\
+		show_plots=show_plots,fname=fname,overwrite_prev=overwrite_prev,num_test_points = num_chisqr_test_points)
+	err_array=[]
+	for key in errs.keys():
+		err_array.append(errs[key])
+	return err_array
+
+def get_MANTID_magFF(q,mag_ion):
+	#Given a str returns a simple array of the mantid defined form factor. basically a shortcut for the mantid version
+	cw = CreateWorkspace(DataX = q,DataY = np.ones(len(q)))
+	cw.getAxis(0).setUnit('MomentumTransfer')
+	ws_corr = MagFormFactorCorrection(cw,IonName=mag_ion,FormFactorWorkspace='FF')
+	FFcorrection = np.array(ws_corr[0].readY(0))
+	return q,FFcorrection
+def calc_chisqr_val(obs_arr,theory_arr,obs_err_arr,theory_err_arr=0.0):
+	#For arbitrary arrays of theory, experiment, errors, returns the chisqr statistic.
+	#Returns it for each point I guess. 
+	N = np.nansum([obs_err_arr<1e9])
+	chisqr = 0
+	obs_arr = np.array(obs_arr)
+	theory_arr = np.array(theory_arr)
+	obs_err_arr = np.array(obs_err_arr)
+	diffsqr = (obs_arr - theory_arr)**2
+	chisqr_arr = diffsqr / obs_err_arr**2
+	chisqr = np.nansum(chisqr_arr) / N
+	return chisqr
+
+class ProgressBar(object):
+	DEFAULT = 'Progress: %(bar)s %(percent)3d%%'
+	FULL = '%(bar)s %(current)d/%(total)d (%(percent)3d%%) %(remaining)d to go'
+
+	def __init__(self, total, width=40, fmt=DEFAULT, symbol='=',
+				 output=sys.stderr):
+		assert len(symbol) == 1
+
+		self.total = total
+		self.width = width
+		self.symbol = symbol
+		self.output = output
+		self.fmt = re.sub(r'(?P<name>%\(.+?\))d',
+			r'\g<name>%dd' % len(str(total)), fmt)
+
+		self.current = 0
+
+	def __call__(self):
+		percent = self.current / float(self.total)
+		size = int(self.width * percent)
+		remaining = self.total - self.current
+		bar = '[' + self.symbol * size + ' ' * (self.width - size) + ']'
+
+		args = {
+			'total': self.total,
+			'bar': bar,
+			'current': self.current,
+			'percent': percent * 100,
+			'remaining': remaining}
+		print('\r' + self.fmt % args,file=self.output, end='')
+
+	def done(self):
+		self.current = self.total
+		self()
+		print('', file=self.output)
